@@ -4,7 +4,9 @@ import torch.nn as nn
 from torchvision.transforms import Resize
 from dataloader import Image_Dataset
 import torch
- 
+import numpy as np
+import os
+
 def collate_list(batch):
     data = [item[0] for item in batch]
     target = [item[1] for item in batch]
@@ -35,7 +37,7 @@ def train_rcnn(config):
     weight_decay = config["weight_decay"]
     num_epochs = config["num_epochs"]
 
-    backbone = models.mobilenet_v2(pretrained=True).features 
+    backbone = models.mobilenet_v2(pretrained=True).features
     backbone.out_channels = 1280
     anchor_generator = models.detection.rpn.AnchorGenerator(sizes=((32, 64, 128, 256, 512),),
                                    aspect_ratios=((0.5, 1.0, 2.0),))
@@ -50,8 +52,8 @@ def train_rcnn(config):
     #model = models.detection.fasterrcnn_resnet50_fpn(pretrained = True)
     #model.roi_heads.box_predictor.cls_score = nn.Linear(1024, len(target_categories))
     #model.backbone.body.conv1 = nn.Conv2d(num_input_channels, 64, kernel_size = (7, 7), stride = (2, 2), padding = {3, 3}, bias = False)
-    
-    print(model) 
+
+    print(model)
     if (torch.cuda.is_available()):
         device = torch.device("cuda:0")
         torch.backends.cudnn.benchmark = True
@@ -67,29 +69,30 @@ def train_rcnn(config):
     model.to(device)
 
 
-    train_set = Image_Dataset("../images_rgb_train/", "coco.json", target_categories)
-    val_set = Image_Dataset("../images_rgb_val/", "coco.json", target_categories)
+    train_set = Image_Dataset("../images_rgb_train/", "coco.json", target_categories, thermal = False)
+    val_set = Image_Dataset("../images_rgb_val/", "coco.json", target_categories, thermal = False)
     train_loader =  torch.utils.data.DataLoader(train_set, batch_size = train_bs, shuffle = True, num_workers = 2, collate_fn = collate_list, drop_last = True)
 
     val_loader =  torch.utils.data.DataLoader(val_set, batch_size = val_bs, shuffle = True, num_workers = 4, collate_fn = collate_list, drop_last = True)
-    
+    print(len(train_loader))
+    print(len(val_loader))
     optim = torch.optim.Adam(model.parameters(), lr = lr, weight_decay = weight_decay)
-    scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size = 20, gamma = 0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size = 5, gamma = 0.7)
     model.train()
-    for epoch in range(num_epochs): 
+    for epoch in range(num_epochs):
         epoch_losses = []
         for images, targets in train_loader:
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
             losses = model(images, targets)
-        
+
             epoch_losses.append(losses)
-            loss = losses["loss_classifier"] + losses["loss_objectness"] + 4*losses["loss_box_reg"] + losses["loss_rpn_box_reg"]  
+            loss = losses["loss_classifier"] + losses["loss_objectness"] + 4*losses["loss_box_reg"] + losses["loss_rpn_box_reg"]
             optim.zero_grad()
             loss.backward()
             optim.step()
-            
-    
+
+
         scheduler.step()
         print("Epoch " + str(epoch))
         print("Class Loss: " + str(sum([d["loss_classifier"] for d in epoch_losses])/len(epoch_losses)))
@@ -97,15 +100,15 @@ def train_rcnn(config):
         print("Loss Box Reg: " + str(sum([d["loss_box_reg"] for d in epoch_losses])/len(epoch_losses)))
         print("Loss RPN Box Reg: " + str(sum([d["loss_rpn_box_reg"] for d in epoch_losses])/len(epoch_losses)))
 
-        #if(i%2):
-        #    validate(model, val_loader, device)
-    torch.save(model, "./faster_rcnn.pt")
+
+        validate(model, val_loader, device)
+    torch.save(model, "./faster_rcnn_rgb.pt")
     model.eval()
     for i in range(0, train_bs):
         input = torch.unsqueeze(images[i], dim = 0)
         output = model(input)
-        idx = torchvision.ops.batched_nms(output[0]["boxes"], output[0]["scores"], output[0]["labels"], 0.6)
-        
+        idx = torchvision.ops.batched_nms(output[0]["boxes"], output[0]["scores"], output[0]["labels"], 0.4)
+
         img = torch.unsqueeze(images[i], dim = 0).cpu()[0]
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
@@ -117,8 +120,37 @@ def train_rcnn(config):
             ax.add_patch(rect)
 
         plt.savefig("./test" + str(i) + ".png")
+
+
 if(__name__ == "__main__"):
-    training_config = {"num_input_channels" : 3, "target_categories" : {1 : 0, 2 : 1, 3 : 2},  "train_bs" : 20, "val_bs" : 10, "lr" : 1e-4, "weight_decay" : 0.1, "num_epochs" : 100}
+    '''device = torch.device("cuda:0")
+    model = torch.load("faster_rcnn.pt")
+    if not os.path.exists("val_images/"):
+        os.mkdir("val_images/")
+    model.eval()
+    target_categories = {1 : 0, 2 : 1, 3 : 2}
+    val_set = Image_Dataset("../images_thermal_val/", "coco.json", target_categories)
+    val_loader =  torch.utils.data.DataLoader(val_set, batch_size = 20, shuffle = True, num_workers = 4, collate_fn = collate_list, drop_last = True)
+
+    images, targets = next(iter(val_loader))
+    images = list(image.to(device) for image in images)
+
+    for i in range(0, 20):
+        input = torch.unsqueeze(images[i], dim = 0)
+        output = model(input)
+        idx = torchvision.ops.batched_nms(output[0]["boxes"], output[0]["scores"], output[0]["labels"], 0.01)
+
+        img = torch.unsqueeze(images[i], dim = 0).cpu()[0]
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        fig, ax = plt.subplots()
+        ax.imshow(img[0])
+        for ix in idx:
+            b_box = output[0]["boxes"][ix].cpu().detach().numpy()
+            rect = patches.Rectangle((b_box[0], b_box[1]), b_box[2] - b_box[0], b_box[3] - b_box[1], linewidth=1, edgecolor='r', facecolor='none')
+            ax.add_patch(rect)
+
+        plt.savefig("./val_images/test" + str(i) + ".png")
+'''
+    training_config = {"num_input_channels" : 3, "target_categories" : {1 : 0, 2 : 1, 3 : 2},  "train_bs" : 15, "val_bs" : 10, "lr" : 5e-5, "weight_decay" : 0.1, "num_epochs" : 25}
     train_rcnn(training_config)
-
-
